@@ -1,0 +1,4 @@
+interface:
+  display_name: "Looker Studio 数据下载"
+  short_description: "用户贴链接，自动解析筛选并下载 CSV"
+  default_prompt: "使用 $looker-studio-data 处理用户提供的 Looker Studio/Data Studio 网页链接。用户只需提供链接；不要要求指定浏览器、操作系统或执行技术命令。自动适配 macOS、Windows 或 Linux；已有 Chrome 时优先使用 Chrome，否则选择 Edge 或 Chromium。自动检查或协助建立 Google 登录态，但任何用户登录状态、Cookie、浏览器 profile、账号信息或取数产物都必须保存在 skill 真源目录之外的用户私有运行目录。结合页面标题、字段、筛选和少量数据样例理解每张报表的业务含义。用浅显中文列出名称、用途和筛选项，不把接口名、组件 ID、英文状态、字段代码或意义不明的值交给用户选择。待用户确认报表、日期、筛选、一次性或重复需求以及保存位置后，导出并验证 CSV。不要默认用户拥有 BigQuery、Google Cloud 或原始数据源权限。"
