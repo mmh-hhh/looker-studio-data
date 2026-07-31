@@ -1,17 +1,17 @@
 ---
 name: looker-studio-data
-description: 公司级 Looker Studio 数据下载 skill。用户只需提供一个 Looker Studio/Data Studio 网页链接，agent 就会复用用户本人 Google 登录态，列出可选报表与筛选项，并按用户确认的条件导出一次性或重复使用的 CSV。适用于日报下载、批量取数和远程服务器定时抓取；不用于绕过访问权限、验证码、二次验证或报表所有者关闭的下载权限。
+description: Looker Studio 数据下载 skill。用户只需提供一个 Looker Studio/Data Studio 网页链接，agent 就会复用用户本人 Google 登录态，列出可选报表与筛选项，并按用户确认的条件导出一次性或重复使用的 CSV。适用于日报下载、批量取数和远程服务器定时抓取；不用于绕过访问权限、验证码、二次验证或报表所有者关闭的下载权限。
 license: Internal
 metadata:
-  scope: company
-  version: 0.4.1
+  scope: portable
+  version: 0.5.0
   author: Codex
   compatibility: [codex, claude-code, hermes, cursor, opencode]
-  tags: [company-skill, looker-studio, data-studio, google-login, csv, report-export]
+  tags: [looker-studio, data-studio, google-login, csv, report-export]
   canonical_name: looker-studio-data
-  runtime_entry: company_skills/looker-studio-data
+  runtime_entry: looker-studio-data
   aliases: [looker-studio, data-studio-data]
-  source_of_truth: company_skills/looker-studio-data
+  source_of_truth: repository-root
   references:
     - references/remote-runtime.md
     - references/protocol.md
@@ -70,7 +70,7 @@ metadata:
 | 用户没有 Chrome 或使用 Windows | 有 Chrome 优先 Chrome；否则自动选择 Edge 或 Chromium，不要求改变日常浏览器 |
 | 登录态复制到另一台机器后失效 | 目标机器重新验证；长期任务优先复用同机专用状态 |
 | 登录过期或出现安全挑战 | 立即停止并用白话通知本人重新登录，不自动处理密码、MFA 或验证码 |
-| 页面请求成功，普通接口回放却返回 400 | 一次性任务使用页面原生成功响应；未验证前不宣称可以定时 |
+| 页面请求成功，普通接口回放却返回 400 | 一次性任务先使用页面原生成功响应；若全量分页仍被拒绝，使用图表“导出数据 → CSV”并核对行数。未验证前不宣称可以定时 |
 | 透视表同时返回空壳、明细和汇总 | 只选有实际明细的主数据，不能把最后一个响应当结果 |
 | 筛选列表采用虚拟滚动或只返回部分值 | 未证明完整时明确标记为预览，不伪装成全部选项 |
 | 日期或筛选表达式无法识别 | 通过页面语义控件重新捕获，不猜内部表达式 |
@@ -82,6 +82,6 @@ metadata:
 
 技术命令不面向业务用户。agent 按需使用运行脚本；跨平台运行见 [远程运行说明](references/remote-runtime.md)，接口与完整性细节见 [取数协议](references/protocol.md)。
 
-## 唯一真源
+## 真源
 
-唯一可编辑真源是 `company_skills/looker-studio-data`。Codex、Claude Code 和其他入口只能使用软链接，不得维护第二份实体副本。
+此仓库根目录是唯一可编辑真源。分发到 Codex、Claude Code 或其他 agent 的副本应通过安装或软链接复用该目录，不维护第二份实现代码。

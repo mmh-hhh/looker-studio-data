@@ -20,7 +20,7 @@ try {
   process.exit(2);
 }
 
-const VERSION = '0.4.1';
+const VERSION = '0.5.0';
 const SKILL_ROOT = path.resolve(__dirname, '..');
 const DATA_ENDPOINT = /\/batchedDataV2\?/;
 const REPORT_ENDPOINT = /\/getReport\?/;
@@ -1404,6 +1404,124 @@ function toCsv(headers, rows) {
   return `\uFEFF${lines.join('\r\n')}\r\n`;
 }
 
+function countCsvDataRows(csv) {
+  let rows = 0;
+  let hasCell = false;
+  let quoted = false;
+  for (let index = 0; index < csv.length; index += 1) {
+    const char = csv[index];
+    if (char === '"') {
+      if (quoted && csv[index + 1] === '"') {
+        index += 1;
+        hasCell = true;
+      } else {
+        quoted = !quoted;
+      }
+      continue;
+    }
+    if (char === '\n' && !quoted) {
+      if (hasCell) rows += 1;
+      hasCell = false;
+      continue;
+    }
+    if (char !== '\r') hasCell = true;
+  }
+  if (quoted) throw new Error('Downloaded CSV has an unterminated quoted field.');
+  if (hasCell) rows += 1;
+  if (!rows) throw new Error('Downloaded CSV is empty.');
+  return rows - 1;
+}
+
+function isReplayRejected(error) {
+  return /batchedDataV2 replay returned HTTP (400|401|403)\b/.test(String(error && error.message || error));
+}
+
+async function clickVisibleNamedAction(page, labels) {
+  const normalized = labels.map((label) => normalizeText(label).toLocaleLowerCase());
+  const result = await page.locator('button, a, [role="menuitem"], [role="menuitemcheckbox"], [role="option"], [role="radio"]').evaluateAll((elements, expected) => {
+    const visible = (element) => Boolean(element.offsetWidth || element.offsetHeight || element.getClientRects().length);
+    const text = (element) => String(element.getAttribute('aria-label') || element.textContent || '').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+    const matches = elements.filter((element) => visible(element) && expected.includes(text(element)));
+    if (matches.length !== 1) {
+      return { count: matches.length, available: elements.filter(visible).map(text).filter(Boolean).slice(0, 30) };
+    }
+    matches[0].click();
+    return { count: 1 };
+  }, normalized);
+  if (result.count !== 1) {
+    throw new Error(`Looker Studio download UI is ambiguous or unavailable for ${labels.join(' / ')}. Visible actions: ${result.available.join(' | ')}`);
+  }
+}
+
+async function hoverVisibleNamedAction(page, labels) {
+  const normalized = labels.map((label) => normalizeText(label).toLocaleLowerCase());
+  const marker = `looker-native-action-${Date.now()}`;
+  const result = await page.locator('button, a, [role="menuitem"], [role="menuitemcheckbox"], [role="option"], [role="radio"]').evaluateAll((elements, input) => {
+    const visible = (element) => Boolean(element.offsetWidth || element.offsetHeight || element.getClientRects().length);
+    const text = (element) => String(element.getAttribute('aria-label') || element.textContent || '').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+    const matches = elements.filter((element) => visible(element) && input.expected.includes(text(element)));
+    if (matches.length === 1) matches[0].setAttribute('data-looker-native-action', input.marker);
+    return { count: matches.length };
+  }, { expected: normalized, marker });
+  if (result.count !== 1) throw new Error(`Looker Studio download UI is ambiguous or unavailable for ${labels.join(' / ')}.`);
+  await page.locator(`[data-looker-native-action="${marker}"]`).hover({ timeout: 5000 });
+}
+
+async function ensureNativeCsvSelected(dialog) {
+  const result = await dialog.evaluate((element) => {
+    const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+    const labels = Array.from(element.querySelectorAll('label'));
+    const csv = labels.find((label) => normalize(label.textContent) === 'csv');
+    if (!csv) return { ok: false, reason: 'CSV option is not available.' };
+    const input = element.querySelector(`#${CSS.escape(csv.htmlFor)}`);
+    if (!input || input.type !== 'radio') return { ok: false, reason: 'CSV option is not a radio control.' };
+    if (!input.checked) csv.click();
+    return { ok: input.checked, reason: input.checked ? '' : 'CSV selection did not apply.' };
+  });
+  if (!result.ok) throw new Error(`Looker Studio native export cannot select CSV: ${result.reason}`);
+}
+
+async function downloadNativeCsv(page, component, output) {
+  const chart = page.locator(`.lego-component.${component.component_id}`);
+  if (await chart.count() !== 1) {
+    throw new Error(`Chart "${component.title}" has no unique visible component for native download.`);
+  }
+  const header = page.locator(`.${component.component_id}-header`);
+  if (await header.count() !== 1) {
+    throw new Error(`Chart "${component.title}" has no unique page header for native download.`);
+  }
+  const menu = header.locator('.ng2-chart-menu-button');
+  if (await menu.count() !== 1) {
+    throw new Error(`Chart "${component.title}" does not expose one native chart menu.`);
+  }
+  await chart.hover({ timeout: 5000 });
+  await menu.click({ timeout: 5000 });
+  await page.waitForTimeout(250);
+  await hoverVisibleNamedAction(page, ['导出图表…', 'Export chart']);
+  await page.waitForTimeout(250);
+  await clickVisibleNamedAction(page, ['导出数据', 'Export data']);
+  await page.waitForTimeout(250);
+  const dialog = page.locator('[role="dialog"]');
+  if (await dialog.count() !== 1) throw new Error(`Chart "${component.title}" did not open a native export dialog.`);
+  await ensureNativeCsvSelected(dialog);
+  const downloadPromise = page.waitForEvent('download', { timeout: 30000 });
+  await clickVisibleNamedAction(page, ['导出', 'Export']);
+  const download = await downloadPromise;
+  const filename = String(download.suggestedFilename() || 'download.csv');
+  if (!/\.csv$/i.test(filename)) {
+    throw new Error(`Chart "${component.title}" downloaded "${filename}", not a CSV file.`);
+  }
+  ensurePrivateDir(path.dirname(output));
+  await download.saveAs(output);
+  try { fs.chmodSync(output, 0o600); } catch {}
+  const csv = fs.readFileSync(output, 'utf8');
+  return {
+    rows: countCsvDataRows(csv),
+    sha256: crypto.createHash('sha256').update(csv).digest('hex'),
+    output,
+  };
+}
+
 function findCatalogComponent(catalog, selector) {
   const exact = catalog.datasets.filter((item) => item.component_id === selector || item.title === selector);
   if (exact.length === 1) return exact[0];
@@ -1457,7 +1575,9 @@ async function runExport(args) {
   if (!capturedComponent) fail('CAPTURE_MISSING', 'The selected component has no private request template.');
 
   const profile = path.resolve(String(args.profile || defaultProfileDir()));
-  const context = await launchAuthorizedContext(args, profile, Boolean(args.headed));
+  // One-time export may need the page's own chart-download UI after direct replay is rejected.
+  // Keep this context visible so the fallback remains available without a user-facing flag.
+  const context = await launchAuthorizedContext(args, profile, true);
   try {
     const page = await primaryPage(context);
     const state = createCaptureState(page);
@@ -1497,6 +1617,64 @@ async function runExport(args) {
         fail('DATE_OVERRIDE_UNSUPPORTED', 'The captured request has no recognizable date range. Set the date in the visible report and catalog again instead of guessing.');
       }
     }
+    const pageSize = Math.min(50000, Math.max(100, Number(args['page-size'] || 10000)));
+    const paginateInfo = request.datasetSpec && request.datasetSpec.paginateInfo;
+    let startRow = paginateInfo && Number(paginateInfo.startRow || 1) || 1;
+    const rows = [];
+    let headers = null;
+    let totalCount = null;
+    let requestsMade = 0;
+    let transportMode = 'direct_replay';
+    const output = resolveExportPath(catalog, component, args.out);
+    let nativeDownload = null;
+
+    try {
+      while (true) {
+        if (paginateInfo) {
+          request.datasetSpec.paginateInfo = { ...request.datasetSpec.paginateInfo, startRow, rowsCount: pageSize };
+        }
+        let payload;
+        if (requestsMade === 0 && latest && latest.response && !appliedDate) {
+          payload = { dataResponse: [latest.response] };
+          transportMode = 'native_chart_response';
+        } else {
+          payload = await fetchComponentPage(page, template.endpoint, request, template.safeHeaders, template.referrer);
+        }
+        requestsMade += 1;
+        const table = mainTable(payload);
+        if (!table) throw new Error('batchedDataV2 response has no tableDataset for the selected component.');
+        const decoded = decodeTable(table, template.fields || capturedComponent.fields);
+        if (!headers) headers = decoded.headers;
+        else if (JSON.stringify(headers) !== JSON.stringify(decoded.headers)) {
+          throw new Error('Column schema changed during pagination.');
+        }
+        rows.push(...decoded.rows);
+        totalCount = decoded.totalCount;
+        if (!paginateInfo || decoded.rows.length === 0 || rows.length >= totalCount) break;
+        startRow += decoded.rows.length;
+        if (requestsMade > 1000) throw new Error('Pagination exceeded 1000 requests; aborting to avoid an unbounded loop.');
+      }
+    } catch (error) {
+      const canUseNativeFallback = isReplayRejected(error) && !appliedDate && args['recipe-out'] === undefined && totalCount !== null;
+      if (!canUseNativeFallback) throw error;
+      nativeDownload = await downloadNativeCsv(page, component, output);
+      if (nativeDownload.rows !== totalCount) {
+        fail('INCOMPLETE_NATIVE_DOWNLOAD', 'The native CSV row count does not match the chart total.', {
+          rows: nativeDownload.rows,
+          total_count: totalCount,
+        });
+      }
+      transportMode = 'native_browser_download';
+    }
+
+    const exportedRows = nativeDownload ? nativeDownload.rows : rows.length;
+    const complete = totalCount === null ? !paginateInfo : exportedRows === totalCount;
+    if (!complete) {
+      fail('INCOMPLETE_EXPORT', 'Returned row count does not match the endpoint total.', { rows: exportedRows, total_count: totalCount });
+    }
+    const csv = nativeDownload ? null : toCsv(headers || [], rows);
+    if (csv) writePrivateFile(output, csv);
+    const checksum = nativeDownload ? nativeDownload.sha256 : crypto.createHash('sha256').update(csv).digest('hex');
     let recipePath = null;
     if (args['recipe-out']) {
       recipePath = resolveRecipePath(catalog, component, args['recipe-out']);
@@ -1511,23 +1689,12 @@ async function runExport(args) {
           source: args.anonymous === true ? 'anonymous' : (context._lookerAuthSource || 'profile'),
         },
         source_url: catalog.source_url,
-        report: {
-          id: catalog.report.id,
-          name: catalog.report.name,
-        },
+        report: { id: catalog.report.id, name: catalog.report.name },
         page: catalog.current_page,
-        component: {
-          id: component.component_id,
-          title: component.title,
-          type: component.type,
-        },
+        component: { id: component.component_id, title: component.title, type: component.type },
         selection: {
           filters: appliedFilters,
-          date_rule: {
-            type: dateRule.type,
-            timezone: dateRule.timezone,
-            fixed_range: dateRule.type === 'fixed' ? dateRule.range : null,
-          },
+          date_rule: { type: dateRule.type, timezone: dateRule.timezone, fixed_range: dateRule.type === 'fixed' ? dateRule.range : null },
         },
         data_request: {
           endpoint: template.endpoint,
@@ -1543,50 +1710,6 @@ async function runExport(args) {
         },
       });
     }
-
-    const pageSize = Math.min(50000, Math.max(100, Number(args['page-size'] || 10000)));
-    const paginateInfo = request.datasetSpec && request.datasetSpec.paginateInfo;
-    let startRow = paginateInfo && Number(paginateInfo.startRow || 1) || 1;
-    const rows = [];
-    let headers = null;
-    let totalCount = null;
-    let requestsMade = 0;
-    let transportMode = 'direct_replay';
-
-    while (true) {
-      if (paginateInfo) {
-        request.datasetSpec.paginateInfo = { ...request.datasetSpec.paginateInfo, startRow, rowsCount: pageSize };
-      }
-      let payload;
-      if (requestsMade === 0 && latest && latest.response && !appliedDate) {
-        payload = { dataResponse: [latest.response] };
-        transportMode = 'native_chart_response';
-      } else {
-        payload = await fetchComponentPage(page, template.endpoint, request, template.safeHeaders, template.referrer);
-      }
-      requestsMade += 1;
-      const table = mainTable(payload);
-      if (!table) throw new Error('batchedDataV2 response has no tableDataset for the selected component.');
-      const decoded = decodeTable(table, template.fields || capturedComponent.fields);
-      if (!headers) headers = decoded.headers;
-      else if (JSON.stringify(headers) !== JSON.stringify(decoded.headers)) {
-        throw new Error('Column schema changed during pagination.');
-      }
-      rows.push(...decoded.rows);
-      totalCount = decoded.totalCount;
-      if (!paginateInfo || decoded.rows.length === 0 || rows.length >= totalCount) break;
-      startRow += decoded.rows.length;
-      if (requestsMade > 1000) throw new Error('Pagination exceeded 1000 requests; aborting to avoid an unbounded loop.');
-    }
-
-    const complete = totalCount === null ? !paginateInfo : rows.length === totalCount;
-    if (!complete) {
-      fail('INCOMPLETE_EXPORT', 'Returned row count does not match the endpoint total.', { rows: rows.length, total_count: totalCount });
-    }
-    const csv = toCsv(headers || [], rows);
-    const output = resolveExportPath(catalog, component, args.out);
-    writePrivateFile(output, csv);
-    const checksum = crypto.createHash('sha256').update(csv).digest('hex');
     const metadataPath = `${output}.meta.json`;
     writePrivateJson(metadataPath, {
       schema_version: 1,
@@ -1608,7 +1731,7 @@ async function runExport(args) {
       verification: {
         transport: transportMode,
         complete,
-        rows: rows.length,
+        rows: exportedRows,
         total_count: totalCount,
         requests: requestsMade,
         sha256: checksum,
@@ -1624,7 +1747,7 @@ async function runExport(args) {
       output,
       metadata: metadataPath,
       component: { id: component.component_id, title: component.title },
-      rows: rows.length,
+      rows: exportedRows,
       total_count: totalCount,
       complete,
       sha256: checksum,
@@ -1950,6 +2073,12 @@ function runSelfTest() {
   if (applyDateOverride(request, { start: '2026-07-01', end: '2026-07-23' }) !== 2) throw new Error('Date override failed.');
   const rolling = resolveDateRule('last-7-days', 'UTC');
   if (!rolling.range || addIsoDays(rolling.range.end, -6) !== rolling.range.start) throw new Error('Rolling date rule failed.');
+  if (countCsvDataRows('name,note\r\na,"line one\nline two"\r\nb,plain\r\n') !== 2) {
+    throw new Error('Native CSV row counter failed.');
+  }
+  if (!isReplayRejected(new Error('batchedDataV2 replay returned HTTP 400.'))) {
+    throw new Error('Replay rejection detector failed.');
+  }
   if (mainTable({ dataResponse: [{ dataSubset: [{ dataset: { tableDataset: table } }] }] }) !== table) {
     throw new Error('Native chart response adapter failed.');
   }
