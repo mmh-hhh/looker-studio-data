@@ -10,6 +10,8 @@
 - 浏览器自动按 Chrome、Edge、Chromium 的顺序选择；
 - AI 环境已经提供 Playwright 时直接复用，不重复安装。
 
+脚本按以下顺序自动发现 Playwright：仓库本地依赖、当前 `NODE_PATH`、Codex workspace bundled runtime。三处都不存在时以 `PLAYWRIGHT_NOT_FOUND` 失败关闭，不尝试静默降级为 DOM 抓取或截图。`doctor` 的 `playwright_source` 可用于确认实际来源。
+
 用户平时使用 Safari、Firefox 或其他浏览器没有关系。skill 使用独立的自动化浏览器状态，不读取用户日常浏览器中的密码。
 
 环境缺少依赖时由 agent 补齐并运行 `doctor`、`self-test`；不要让业务用户照抄安装命令。不同平台的私有运行目录由脚本自动选择，也可以由项目明确指定，不能写死某台机器的绝对路径。

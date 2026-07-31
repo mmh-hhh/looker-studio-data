@@ -1,6 +1,6 @@
 {
   "name": "looker-studio-data-skill-runtime",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
   "description": "Looker Studio 数据下载 skill 的可移植运行环境",
   "license": "UNLICENSED",
@@ -8,6 +8,7 @@
     "playwright": "1.61.1"
   },
   "scripts": {
+    "test": "node --test tests/*.test.cjs",
     "self-test": "node scripts/looker_studio_data.cjs self-test"
   }
 }
