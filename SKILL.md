@@ -4,7 +4,7 @@ description: Looker Studio 数据下载 skill。用户只需提供一个 Looker 
 license: Internal
 metadata:
   scope: portable
-  version: 0.5.0
+  version: 0.6.0
   author: Codex
   compatibility: [codex, claude-code, hermes, cursor, opencode]
   tags: [looker-studio, data-studio, google-login, csv, report-export]
@@ -37,6 +37,8 @@ metadata:
 4. 按确认的报表、日期和筛选条件下载 CSV；
 5. 检查权限、筛选、行数和文件完整性；
 6. 重复需求验证两次后，才交付可定时运行的方案。
+
+当用户要求一次处理多个页面时，agent 应使用同一个登录 context 串行目录化所选页面，生成一个汇总 manifest。manifest 的 `complete`、`partial`、`failed` 是业务结果状态；只要有页面未完整捕获，就不能把整批任务报告为成功。
 
 ## 结果导向原则
 
@@ -81,6 +83,16 @@ metadata:
 | 默认建议 BigQuery | 只有用户明确拥有原始数据源权限时才讨论替代接口 |
 
 技术命令不面向业务用户。agent 按需使用运行脚本；跨平台运行见 [远程运行说明](references/remote-runtime.md)，接口与完整性细节见 [取数协议](references/protocol.md)。
+
+## 多页面与业务选择
+
+- 单页目录使用 `catalog`；多个指定页面或整份报表使用 `catalog-report`，并复用同一浏览器登录 context 串行执行。
+- `catalog-report` 的 `--page` 接受页面业务名称、页面 ID 或页面 URL；`--all-pages` 只在用户明确要求整份报表时使用。
+- 批量目录默认只读取当前可见筛选状态，不逐个展开筛选值，避免额外交互影响后续页面导航；只有确需预览筛选候选时才启用 `--filter-values`。
+- 每个页面分别保存 catalog 和私密 capture，文件名始终包含页面 ID，避免同名或“无标题页面”互相覆盖；根目录另存 `manifest.json`。
+- 向用户展示图表时使用 `selection_label`，执行选择时优先使用稳定、页面范围内的 `selection_key`。只有兼容旧 catalog 时才接受组件 ID，不能要求业务用户理解或提供组件 ID。
+- 同名图表必须给出字段、区域或行数等业务消歧信息；`qt_...` 等内部字段别名不得出现在用户选项中。
+- 导出优先复用页面原生完整响应；只有完整 batch 的零修改回放成功后，才允许改目标 request 做分页。回放不支持且页面允许下载时，使用原生“导出数据 → CSV / CSV (Excel)”兜底并核对总行数。
 
 ## 真源
 

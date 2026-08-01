@@ -34,11 +34,14 @@
 1. 打开指定报表页面；
 2. 读取 `getReport`，确认当前访问权和 `downloadable`；
 3. 读取 `getSchema`，把内部字段映射为业务名称；
-4. 捕获当前页面成功的 `batchedDataV2` 请求和响应；
-5. 生成只含元数据的 catalog；
-6. 把可选报表和筛选项交给用户确认。
+4. 等待当前页面稳定，并逐个激活尚未发出请求的可见数据组件；
+5. 捕获当前页面成功的 `batchedDataV2` 完整 batch、目标 request 索引和响应；
+6. 生成只含当前页元数据的 catalog；
+7. 把可选报表和筛选项交给用户确认。
 
-capture 可以保存无凭证的请求模板，但不能保存数据响应、Cookie 或授权头。
+capture 可以保存无凭证的完整 batch 请求模板和目标 `request_index`，但不能保存数据响应、Cookie 或授权头。
+
+多页面目录化必须在一个登录 context 中串行执行。默认只读取筛选控件当前可见状态，不逐个展开候选值；需要深度筛选预览时才显式启用。每页独立产出 catalog/capture，文件名包含页面 ID；汇总 `manifest.json` 记录真实页面名、捕获率、耗时、筛选和逐页错误。只有所有页面都是 `ready` 时 manifest 才是 `complete`；部分页面或组件缺失必须标记 `partial` 并返回非零退出状态，零捕获不得假成功。
 
 ## 原生请求与普通回放
 
@@ -48,7 +51,15 @@ capture 可以保存无凭证的请求模板，但不能保存数据响应、Coo
 - 相同 URL、Cookie、请求体和可见请求头由普通 `fetch` 发送时可能返回 HTTP 400；
 - 因此不能假设所有私有报表都支持合成请求回放。
 
-一次性导出应优先使用页面已经成功返回的原生响应。若后续分页回放被拒绝、页面仍允许下载且已有图表总行数，可使用图表自身的“导出数据 → CSV”流程，并将 CSV 行数与图表总数核对。该 UI 回退只用于一次性导出，不能保存为定时配方。只有真实验证通过后，才使用保存的请求做回放、日期改写或分页。
+一次性导出应优先使用页面已经成功返回的原生响应。需要分页或改写日期前，必须先把捕获到的完整 batch 原样回放一次，不能只抽出单个 request 探测。原样回放成功后，只替换 `request_index` 指向的目标 request，其余 batch 成员和外层结构保持不变；失败则把 `replay_capability` 标记为 `unsupported`，不得继续合成分页请求。
+
+若完整 batch 回放被拒绝、页面仍允许下载且已有图表总行数，可使用图表自身的“导出数据 → CSV”流程，并将 CSV 行数与图表总数核对。格式选择需兼容 `CSV`、`CSV (Excel)`、全角括号及 label/radio/select 等控件结构。该 UI 回退是正式的一次性导出传输方式，不能保存为定时配方。只有真实验证通过后，才使用保存的请求做回放、日期改写或分页。
+
+导出元数据必须记录：
+
+- `transport`: `native_chart_response`、`whole_batch_replay`、`single_request_replay` 或 `native_browser_download`；
+- `replay_capability`: `not_needed`、`whole_batch_replay`、`single_request_replay` 或 `unsupported`；
+- 实际行数、接口总数、请求次数和 SHA-256。
 
 同一透视表可能连续返回：
 
@@ -73,7 +84,7 @@ capture 可以保存无凭证的请求模板，但不能保存数据响应、Coo
 1. 选择用户确认的组件；
 2. 获取该组件可用的主数据响应；
 3. 解析 `tableDataset` 的字段和列式数据；
-4. 有分页信息时继续到 `totalCount`；
+4. 有分页信息且完整 batch 原样回放成功时，继续到 `totalCount`；否则转原生浏览器 CSV；
 5. 写 UTF-8 CSV；
 6. 写选择条件、行数和 SHA-256 元数据；
 7. 对比实际行数与接口总数。
@@ -89,7 +100,7 @@ capture 可以保存无凭证的请求模板，但不能保存数据响应、Coo
 | `downloadable: false` | 只展示目录，不抓数据 |
 | 找不到组件请求 | 打开对应页面后重新 catalog |
 | 日期结构未知 | 页面设置日期后重新 catalog |
-| 普通回放 HTTP 400 | 使用原生成功响应；重复任务暂不判定可用 |
+| 完整 batch 原样回放 HTTP 400 | 标记 `replay_capability: unsupported`；一次性导出转原生浏览器 CSV，重复任务暂不判定可用 |
 | 原生下载菜单不可识别或 CSV 行数不等于总数 | 停止，不交付文件；提示用户可在浏览器手动下载 |
 | 行数小于 `totalCount` | 停止，不交付部分文件 |
 | 响应结构变化 | 保留错误与组件 ID，更新解析器后重新验证 |

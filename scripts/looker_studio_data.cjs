@@ -8,19 +8,58 @@ const os = require('node:os');
 const path = require('node:path');
 const readline = require('node:readline');
 
-let chromium;
-try {
-  ({ chromium } = require('playwright'));
-} catch (error) {
+const {
+  assessCaptureState,
+  isCsvFormatLabel,
+  replaceBatchRequestTarget,
+  reportPageFileStem,
+  reportPageUrl,
+  selectCatalogComponent,
+  usablePageName,
+} = require('./looker_studio_core.cjs');
+
+function codexPlaywrightCandidates() {
+  const runtimeRoot = path.join(os.homedir(), '.cache', 'codex-runtimes');
+  try {
+    return fs.readdirSync(runtimeRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => path.join(runtimeRoot, entry.name, 'dependencies', 'node', 'node_modules', 'playwright'));
+  } catch {
+    return [];
+  }
+}
+
+function loadPlaywright() {
+  const attempts = [{ source: 'node-resolution', target: 'playwright' }];
+  for (const moduleRoot of String(process.env.NODE_PATH || '').split(path.delimiter).filter(Boolean)) {
+    attempts.push({ source: 'NODE_PATH', target: path.join(moduleRoot, 'playwright') });
+  }
+  for (const target of codexPlaywrightCandidates()) attempts.push({ source: 'codex-workspace', target });
+  const seen = new Set();
+  for (const attempt of attempts) {
+    if (seen.has(attempt.target)) continue;
+    seen.add(attempt.target);
+    try {
+      return { module: require(attempt.target), source: attempt.source };
+    } catch (error) {
+      if (error && error.code !== 'MODULE_NOT_FOUND') throw error;
+    }
+  }
+  return null;
+}
+
+const playwrightRuntime = loadPlaywright();
+if (!playwrightRuntime) {
   console.error(JSON.stringify({
     ok: false,
     code: 'PLAYWRIGHT_NOT_FOUND',
-    message: 'Playwright is unavailable. Load the Codex workspace dependencies and run this script with their Node executable and NODE_PATH.',
+    message: 'Playwright is unavailable in local dependencies, NODE_PATH, or the Codex workspace runtime.',
   }, null, 2));
   process.exit(2);
 }
+const { chromium } = playwrightRuntime.module;
 
-const VERSION = '0.5.0';
+const VERSION = '0.6.0';
 const SKILL_ROOT = path.resolve(__dirname, '..');
 const DATA_ENDPOINT = /\/batchedDataV2\?/;
 const REPORT_ENDPOINT = /\/getReport\?/;
@@ -36,7 +75,7 @@ function fail(code, message, details = undefined, exitCode = 1) {
 }
 
 function parseArgs(argv) {
-  const result = { _: [], filter: [] };
+  const result = { _: [], filter: [], page: [] };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (!arg.startsWith('--')) {
@@ -51,6 +90,7 @@ function parseArgs(argv) {
     }
     if (value === undefined) value = true;
     if (key === 'filter') result.filter.push(String(value));
+    else if (key === 'page') result.page.push(String(value));
     else result[key] = value;
   }
   return result;
@@ -477,17 +517,18 @@ async function pageAuthState(page) {
   };
 }
 
-function createCaptureState(page) {
+function createCaptureState(page, seed = {}) {
   const state = {
-    report: null,
-    reportRequest: null,
-    schemas: new Map(),
+    report: seed.report || null,
+    reportRequest: seed.reportRequest || null,
+    schemas: new Map(seed.schemas || []),
     batched: [],
     pending: new Set(),
     errors: [],
+    lastRelevantResponseAt: Date.now(),
   };
 
-  page.on('response', (response) => {
+  const onResponse = (response) => {
     const url = response.url();
     if (!REPORT_ENDPOINT.test(url) && !SCHEMA_ENDPOINT.test(url) && !DATA_ENDPOINT.test(url)) return;
     const pending = (async () => {
@@ -503,6 +544,7 @@ function createCaptureState(page) {
         const headers = await request.allHeaders().catch(() => ({}));
         if (REPORT_ENDPOINT.test(url)) {
           state.report = parsed;
+          state.lastRelevantResponseAt = Date.now();
           state.reportRequest = {
             url,
             method: request.method(),
@@ -526,6 +568,7 @@ function createCaptureState(page) {
           let requestBody = {};
           try { requestBody = JSON.parse(request.postData() || '{}'); } catch {}
           if (requestBody.datasourceId) state.schemas.set(requestBody.datasourceId, parsed);
+          state.lastRelevantResponseAt = Date.now();
           return;
         }
         let requestBody;
@@ -546,13 +589,16 @@ function createCaptureState(page) {
           referrer: headers.referer || '',
           capturedAt: new Date().toISOString(),
         });
+        state.lastRelevantResponseAt = Date.now();
       } catch (error) {
         state.errors.push({ endpoint: new URL(url).pathname, issue: String(error.message || error) });
       }
     })();
     state.pending.add(pending);
     pending.finally(() => state.pending.delete(pending));
-  });
+  };
+  page.on('response', onResponse);
+  state.dispose = () => page.off('response', onResponse);
   return state;
 }
 
@@ -563,6 +609,121 @@ async function waitForCapture(state, timeoutMs, requireData = true) {
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   await Promise.allSettled([...state.pending]);
+}
+
+async function gotoReportPage(page, url) {
+  let firstError;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      return await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    } catch (error) {
+      if (attempt === 2) {
+        if (firstError) error.message = `${error.message}\nFirst navigation attempt: ${firstError.message}`;
+        throw error;
+      }
+      firstError = error;
+      await page.goto('about:blank', { waitUntil: 'commit', timeout: 5000 }).catch(() => {});
+      await page.waitForTimeout(1000);
+    }
+  }
+  return null;
+}
+
+function isDataComponentConfig(component) {
+  const type = component && component.type || '';
+  return Boolean(component && (component.datasourceId || component.conceptDefs && component.conceptDefs.length))
+    && !NON_DATA_TYPE_RE.test(type);
+}
+
+function pageSlugFromUrl(value) {
+  const match = String(value || '').match(/\/page\/([A-Za-z0-9_-]+)/i);
+  return match ? match[1] : null;
+}
+
+async function pageHasVisibleLoading(page) {
+  return page.locator('[role="progressbar"]:visible, mat-progress-bar:visible').count()
+    .then((count) => count > 0)
+    .catch(() => false);
+}
+
+async function activateMissingComponents(page, componentIds) {
+  let activated = 0;
+  for (const componentId of componentIds) {
+    const component = page.locator(`.lego-component.${componentId}`);
+    if (await component.count() !== 1) continue;
+    await component.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+    await component.hover({ timeout: 3000 }).catch(() => {});
+    activated += 1;
+  }
+  return activated;
+}
+
+async function waitForPageCapture(page, state, expectedPageId, timeoutMs, stableWindowMs = 1000) {
+  const deadline = Date.now() + timeoutMs;
+  let activationRounds = 0;
+  let latest = null;
+  while (Date.now() < deadline) {
+    await Promise.allSettled([...state.pending]);
+    const pages = reportPages(state.report);
+    const currentPage = pages.find((item) => item.id === expectedPageId) || null;
+    const expectedComponentIds = currentPage
+      ? currentPage.components.filter(isDataComponentConfig).map((component) => component.componentId)
+      : [];
+    const traces = componentTraces(state, schemaFieldMaps(state.schemas));
+    const tracedComponentIds = [...traces.values()]
+      .filter((trace) => !trace.pageId || trace.pageId === expectedPageId)
+      .map((trace) => trace.componentId);
+    latest = assessCaptureState({
+      reportReady: Boolean(state.report),
+      expectedPageId,
+      observedPageId: pageSlugFromUrl(page.url()),
+      loading: await pageHasVisibleLoading(page),
+      expectedComponentIds,
+      tracedComponentIds,
+      lastRelevantResponseAt: state.lastRelevantResponseAt,
+      now: Date.now(),
+      stableWindowMs,
+    });
+
+    if (latest.settled && latest.missingComponentIds.length && activationRounds < 2) {
+      activationRounds += 1;
+      await activateMissingComponents(page, latest.missingComponentIds);
+      state.lastRelevantResponseAt = Date.now();
+      await page.waitForTimeout(750);
+      continue;
+    }
+    if (latest.settled) return {
+      ...latest,
+      timedOut: false,
+      activatedMissing: activationRounds > 0,
+      activationRounds,
+    };
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  await Promise.allSettled([...state.pending]);
+  const timedOut = latest || {
+      settled: false,
+      status: 'waiting',
+      reason: 'capture_timeout',
+      expectedCount: 0,
+      readyCount: 0,
+      readyComponentIds: [],
+      missingComponentIds: [],
+    };
+  if (timedOut.status === 'waiting' && timedOut.expectedCount >= 0) {
+    timedOut.status = timedOut.readyCount === timedOut.expectedCount && timedOut.expectedCount > 0
+      ? 'ready'
+      : timedOut.readyCount > 0 ? 'partial' : 'empty';
+    timedOut.reason = timedOut.status === 'ready'
+      ? 'all_data_components_captured_at_timeout'
+      : timedOut.status === 'partial' ? 'some_data_components_missing_at_timeout' : 'no_data_components_captured_at_timeout';
+  }
+  return {
+    ...timedOut,
+    timedOut: true,
+    activatedMissing: activationRounds > 0,
+    activationRounds,
+  };
 }
 
 function reportShareable(report) {
@@ -679,6 +840,8 @@ function componentTraces(state, fieldMaps) {
         safeHeaders: batch.safeHeaders,
         referrer: batch.referrer,
         request,
+        batchRequest: batch.request,
+        requestIndex: index,
         response: responses[index],
         responseSummary,
         capturedAt: batch.capturedAt,
@@ -694,20 +857,33 @@ function componentTraces(state, fieldMaps) {
 }
 
 async function inspectDom(page, includeFilterValues) {
-  const components = await page.evaluate(() => Array.from(document.querySelectorAll('.lego-component')).slice(0, 400).map((element) => {
+  const components = await page.evaluate(() => {
+    const headings = Array.from(document.querySelectorAll('h2, [role="heading"][aria-level="2"]')).map((element) => ({
+      text: (element.textContent || '').replace(/\s+/g, ' ').trim(),
+      top: element.getBoundingClientRect().top + window.scrollY,
+    })).filter((item) => item.text);
+    return Array.from(document.querySelectorAll('.lego-component')).slice(0, 400).map((element) => {
     const classes = String(element.className || '').split(/\s+/);
     const id = classes.find((value) => /^cd-/.test(value)) || '';
     const type = classes.find((value) => value !== 'lego-component' && value !== 'small-layout' && !/^cd-/.test(value)) || '';
     const shell = element.closest('.cdk-drag') || element.parentElement || element;
     const titleNodes = shell.querySelectorAll('[class*="title"], ng2-component-header, .component-title, .chart-title');
     const titles = Array.from(titleNodes).map((node) => (node.textContent || '').replace(/\s+/g, ' ').trim()).filter(Boolean);
+    const top = element.getBoundingClientRect().top + window.scrollY;
+    const section = headings.filter((heading) => heading.top <= top + 4).sort((a, b) => b.top - a.top)[0];
+    const visibleHeaders = Array.from(element.querySelectorAll('[role="columnheader"], .table-header-cell, .header-cell'))
+      .map((node) => (node.textContent || node.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim())
+      .filter(Boolean);
     return {
       id,
       type,
       title: titles[0] || '',
+      section: section && section.text || '',
+      visible_headers: [...new Set(visibleHeaders)].slice(0, 100),
       text: (element.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 500),
     };
-  }).filter((item) => item.id));
+    }).filter((item) => item.id);
+  });
 
   const byId = new Map(components.map((item) => [item.id, item]));
   const filters = [];
@@ -754,6 +930,64 @@ async function inspectDom(page, includeFilterValues) {
   return { components, byId, filters };
 }
 
+async function inspectNavigation(page) {
+  const items = await page.evaluate(() => Array.from(document.querySelectorAll('[role="treeitem"][id]')).map((element) => ({
+    id: element.id || '',
+    name: String(element.getAttribute('aria-label') || element.textContent || '').replace(/\s+/g, ' ').trim(),
+    active: element.getAttribute('aria-current') === 'page'
+      || element.getAttribute('aria-selected') === 'true'
+      || /(?:^|\s)xap-nav-item-active(?:\s|$)/.test(String(element.className || '')),
+  })).filter((item) => /^p_/.test(item.id) && item.name));
+  return {
+    items,
+    byId: new Map(items.map((item) => [item.id, item.name])),
+    current: items.find((item) => item.active) || null,
+  };
+}
+
+function mergeVisibleFieldNames(fields, visibleHeaders) {
+  const headers = (visibleHeaders || []).filter(Boolean);
+  if (!headers.length) return fields;
+  return (fields || []).map((field, index) => {
+    const internal = !field.name || /^qt_|^_.*_$/.test(field.name) || field.name === field.source_field;
+    return internal && headers[index] ? { ...field, name: headers[index] } : field;
+  });
+}
+
+function isInternalFieldName(name, sourceField = '') {
+  const value = normalizeText(name);
+  return !value || /^qt_[A-Za-z0-9_-]+$/i.test(value) || /^_.*_$/.test(value) || value === sourceField;
+}
+
+function mergeConfiguredFieldNames(traceFields, configuredFields) {
+  const byAlias = new Map((configuredFields || []).map((field) => [field.query_alias, field]));
+  return (traceFields || []).map((field, index) => {
+    const configured = byAlias.get(field.query_alias) || configuredFields && configuredFields[index];
+    if (configured && !isInternalFieldName(configured.name, configured.source_field)
+      && isInternalFieldName(field.name, field.source_field)) {
+      return { ...field, name: configured.name };
+    }
+    return field;
+  });
+}
+
+function selectionMetadata(dataset, ordinal = 1) {
+  const section = usablePageName(dataset.section) || '数据';
+  const fieldSummary = (dataset.fields || [])
+    .filter((field) => !isInternalFieldName(field.name, field.source_field))
+    .map((field) => field.name)
+    .filter(Boolean)
+    .slice(0, 2)
+    .join('、');
+  const base = [dataset.page_id, safeName(section), safeName(dataset.title), safeName(fieldSummary || 'table')].join('/');
+  const rowCount = dataset.row_summary && dataset.row_summary.main && Number(dataset.row_summary.main.totalCount);
+  const details = [section !== dataset.title ? section : '', fieldSummary, Number.isFinite(rowCount) ? `${rowCount} 行` : '', ordinal > 1 ? `候选 ${ordinal}` : ''].filter(Boolean);
+  return {
+    selection_key: ordinal > 1 ? `${base}-${ordinal}` : base,
+    selection_label: details.length ? `${dataset.title}——${details.join('；')}` : dataset.title,
+  };
+}
+
 function componentFieldsFromConfig(component, fieldMaps) {
   const sourceMap = fieldMaps.get(component.datasourceId) || new Map();
   const seen = new Set();
@@ -777,26 +1011,29 @@ function componentFieldsFromConfig(component, fieldMaps) {
   return result;
 }
 
-function buildCatalog({ normalized, state, dom, catalogPath, capturePath }) {
+function buildCatalog({ normalized, state, dom, navigation, catalogPath, capturePath, currentPageId, captureAssessment }) {
   const shareable = reportShareable(state.report);
-  const pages = reportPages(state.report);
+  const pages = reportPages(state.report).map((page) => ({
+    ...page,
+    name: usablePageName(navigation && navigation.byId.get(page.id)) || usablePageName(page.name) || page.id,
+  }));
   const fieldMaps = schemaFieldMaps(state.schemas);
   const traces = componentTraces(state, fieldMaps);
-  const currentPageId = [...traces.values()].find((trace) => trace.pageId)?.pageId || null;
   const currentPage = pages.find((page) => page.id === currentPageId) || null;
   const domById = dom.byId;
   const datasets = [];
   const captureComponents = {};
 
-  for (const page of pages) {
+  for (const page of pages.filter((item) => !currentPageId || item.id === currentPageId)) {
     for (const component of page.components) {
       const type = component.type || '';
-      const isData = Boolean(component.datasourceId || component.conceptDefs && component.conceptDefs.length)
-        && !NON_DATA_TYPE_RE.test(type);
-      if (!isData) continue;
+      if (!isDataComponentConfig(component)) continue;
       const trace = traces.get(component.componentId);
       const domComponent = domById.get(component.componentId);
-      const fields = trace && trace.fields.length ? trace.fields : componentFieldsFromConfig(component, fieldMaps);
+      const configuredFields = componentFieldsFromConfig(component, fieldMaps);
+      const traceFields = trace && trace.fields.length ? trace.fields : configuredFields;
+      const rawFields = mergeConfiguredFieldNames(traceFields, configuredFields);
+      const fields = mergeVisibleFieldNames(rawFields, domComponent && domComponent.visible_headers);
       const onCurrentPage = currentPageId && page.id === currentPageId;
       let status = 'open_page_to_capture';
       let reason = 'Open this report page and catalog it to capture the component request.';
@@ -816,6 +1053,7 @@ function buildCatalog({ normalized, state, dom, catalogPath, capturePath }) {
         page_name: page.name,
         component_id: component.componentId,
         title,
+        section: domComponent && domComponent.section || '',
         type,
         datasource_id: component.datasourceId || trace && trace.datasourceId || null,
         fields,
@@ -835,9 +1073,24 @@ function buildCatalog({ normalized, state, dom, catalogPath, capturePath }) {
           referrer: trace.referrer,
           fields,
           request: trace.request,
+          batch_request: trace.batchRequest,
+          request_index: trace.requestIndex,
           captured_at: trace.capturedAt,
         };
       }
+    }
+  }
+
+  const selectionCounts = new Map();
+  for (const dataset of datasets) {
+    const fingerprint = [dataset.page_id, dataset.section, dataset.title, dataset.fields.map((field) => field.name).join('|')].join('\n');
+    const ordinal = (selectionCounts.get(fingerprint) || 0) + 1;
+    selectionCounts.set(fingerprint, ordinal);
+    Object.assign(dataset, selectionMetadata(dataset, ordinal));
+    if (captureComponents[dataset.component_id]) {
+      captureComponents[dataset.component_id].selection_key = dataset.selection_key;
+      captureComponents[dataset.component_id].selection_label = dataset.selection_label;
+      captureComponents[dataset.component_id].fields = dataset.fields;
     }
   }
 
@@ -858,6 +1111,7 @@ function buildCatalog({ normalized, state, dom, catalogPath, capturePath }) {
     pages: pages.map((page) => ({ id: page.id, name: page.name, component_count: page.components.length })),
     filters: dom.filters,
     datasets,
+    capture_status: captureAssessment || null,
     private_capture_file: capturePath,
     security: {
       contains_cookies: false,
@@ -909,6 +1163,7 @@ async function runDoctor(args) {
     node: process.version,
     platform: process.platform,
     playwright: true,
+    playwright_source: playwrightRuntime.source,
     browser_choice: choice,
     detected_browser: detectedBrowser,
     interactive_login_supported: Boolean(detectedBrowser),
@@ -1076,46 +1331,220 @@ async function runStatus(args) {
   }
 }
 
+async function collectPageCatalog(page, normalized, args, paths, seed = {}) {
+  const timeoutMs = Math.max(5000, Number(args.timeout || 45000));
+  const attempts = Math.max(1, Math.min(2, Number(args.attempts || 2)));
+  let best = null;
+  let sharedSeed = seed;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const state = createCaptureState(page, sharedSeed);
+    try {
+      await gotoReportPage(page, normalized.url);
+      const assessment = await waitForPageCapture(page, state, normalized.pageSlug, timeoutMs);
+      const auth = await pageAuthState(page);
+      if (auth.loginRedirect) throw Object.assign(new Error('Google login is required or the reusable auth state expired.'), { code: 'LOGIN_REQUIRED' });
+      if (auth.denied) throw Object.assign(new Error('The signed-in Google account does not have access to this report.'), { code: 'ACCESS_DENIED' });
+      if (!state.report) {
+        throw Object.assign(new Error('The report metadata request was not captured.'), {
+          code: 'REPORT_METADATA_MISSING',
+          details: state.errors,
+        });
+      }
+      const dom = await inspectDom(page, args['no-filter-values'] !== true);
+      const navigation = await inspectNavigation(page);
+      const finalAssessment = await waitForPageCapture(
+        page,
+        state,
+        normalized.pageSlug,
+        Math.min(5000, timeoutMs),
+        500,
+      );
+      const effectiveAssessment = finalAssessment.readyCount > assessment.readyCount
+        || (finalAssessment.readyCount === assessment.readyCount && finalAssessment.settled && !assessment.settled)
+        ? finalAssessment : assessment;
+      const built = buildCatalog({
+        normalized,
+        state,
+        dom,
+        navigation,
+        catalogPath: paths.catalogPath,
+        capturePath: paths.capturePath,
+        currentPageId: normalized.pageSlug,
+        captureAssessment: { ...effectiveAssessment, attempt },
+      });
+      const result = {
+        built,
+        assessment: { ...effectiveAssessment, attempt },
+        seed: { report: state.report, reportRequest: state.reportRequest, schemas: [...state.schemas.entries()] },
+      };
+      sharedSeed = result.seed;
+      if (!best || result.assessment.readyCount > best.assessment.readyCount) best = result;
+      if (effectiveAssessment.status === 'ready') return result;
+    } finally {
+      state.dispose();
+    }
+  }
+  return best;
+}
+
+function catalogCommandResult(built) {
+  const catalog = built.catalog;
+  const status = catalog.capture_status && catalog.capture_status.status || 'empty';
+  return {
+    ok: status === 'ready',
+    status,
+    catalog: built.catalogPath,
+    private_capture: catalog.private_capture_file,
+    report: catalog.report,
+    current_page: catalog.current_page,
+    capture: catalog.capture_status,
+    datasets: {
+      total: catalog.datasets.length,
+      ready: catalog.datasets.filter((item) => item.status === 'ready').length,
+      blocked: catalog.datasets.filter((item) => item.status === 'blocked_by_owner').length,
+    },
+    filters: catalog.filters.length,
+  };
+}
+
+function persistCatalogResult(result) {
+  writePrivateJson(result.built.capture.private_capture_file || result.built.catalog.private_capture_file, result.built.capture);
+  writePrivateJson(result.built.catalogPath, result.built.catalog);
+}
+
 async function runCatalog(args) {
   if (!args.url) fail('MISSING_URL', 'catalog requires --url <Looker Studio URL>.');
   const normalized = normalizeReportUrl(String(args.url));
+  if (!normalized.pageSlug) fail('MISSING_PAGE', 'catalog requires a report page URL containing /page/<id>.');
   const profile = path.resolve(String(args.profile || defaultProfileDir()));
-  const timeoutMs = Math.max(5000, Number(args.timeout || 45000));
   const context = await launchAuthorizedContext(args, profile, Boolean(args.headed));
   try {
     const page = await primaryPage(context);
-    const state = createCaptureState(page);
-    await page.goto(normalized.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await waitForCapture(state, timeoutMs, true);
-    const auth = await pageAuthState(page);
-    if (auth.loginRedirect) fail('LOGIN_REQUIRED', 'Google login is required or the reusable auth state expired. Initialize it locally with login and redeploy the auth-state file.', {
-      profile,
-      auth_state: resolveAuthStatePath(args, profile),
-    });
-    if (auth.denied) fail('ACCESS_DENIED', 'The signed-in Google account does not have access to this report.');
-    if (!state.report) fail('REPORT_METADATA_MISSING', 'The report metadata request was not captured. The page may still be loading or Looker Studio changed its endpoint.', state.errors);
-    const dom = await inspectDom(page, args['no-filter-values'] !== true);
-    const { catalogPath, capturePath } = resolveCatalogPaths(normalized, args.out);
-    const built = buildCatalog({ normalized, state, dom, catalogPath, capturePath });
-    writePrivateJson(capturePath, built.capture);
-    writePrivateJson(catalogPath, built.catalog);
+    const paths = resolveCatalogPaths(normalized, args.out);
+    const result = await collectPageCatalog(page, normalized, args, paths);
+    if (!result) fail('CATALOG_EMPTY', 'The page could not be cataloged.');
+    persistCatalogResult(result);
     const authStatePath = resolveAuthStatePath(args, profile);
-    if (fs.existsSync(authStatePath)) {
-      await persistBrowserAuthState(context, authStatePath);
+    if (fs.existsSync(authStatePath)) await persistBrowserAuthState(context, authStatePath);
+    const output = catalogCommandResult(result.built);
+    console.log(JSON.stringify(output, null, 2));
+    if (!output.ok) process.exitCode = 1;
+  } finally {
+    await closeContext(context);
+  }
+}
+
+function resolveReportPageSelection(pages, selector) {
+  const raw = String(selector || '').trim();
+  const slug = pageSlugFromUrl(raw) || raw;
+  const exact = pages.filter((page) => page.id === slug || page.name === raw);
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1) throw Object.assign(new Error(`Multiple report pages match "${raw}".`), { code: 'AMBIGUOUS_PAGE' });
+  const partial = pages.filter((page) => page.name && page.name.includes(raw));
+  if (partial.length === 1) return partial[0];
+  throw Object.assign(new Error(`No report page matches "${raw}".`), { code: 'PAGE_NOT_FOUND' });
+}
+
+async function runCatalogReport(args) {
+  if (!args.url) fail('MISSING_URL', 'catalog-report requires --url <Looker Studio URL>.');
+  if (!args.page.length && args['all-pages'] !== true) {
+    fail('MISSING_PAGE_SELECTION', 'catalog-report requires one or more --page values or --all-pages.');
+  }
+  const normalizedStart = normalizeReportUrl(String(args.url));
+  if (!normalizedStart.pageSlug) fail('MISSING_PAGE', 'catalog-report requires a starting report page URL.');
+  if (args['filter-values'] !== true) args['no-filter-values'] = true;
+  const profile = path.resolve(String(args.profile || defaultProfileDir()));
+  const context = await launchAuthorizedContext(args, profile, Boolean(args.headed));
+  try {
+    const page = await primaryPage(context);
+    const discoveryState = createCaptureState(page);
+    let report;
+    let reportRequest;
+    let schemas;
+    try {
+      await gotoReportPage(page, normalizedStart.url);
+      await waitForCapture(discoveryState, Math.max(5000, Number(args.timeout || 45000)), false);
+      report = discoveryState.report;
+      reportRequest = discoveryState.reportRequest;
+      schemas = [...discoveryState.schemas.entries()];
+    } finally {
+      discoveryState.dispose();
     }
-    console.log(JSON.stringify({
-      ok: true,
-      catalog: catalogPath,
-      private_capture: capturePath,
-      report: built.catalog.report,
-      current_page: built.catalog.current_page,
-      datasets: {
-        total: built.catalog.datasets.length,
-        ready: built.catalog.datasets.filter((item) => item.status === 'ready').length,
-        blocked: built.catalog.datasets.filter((item) => item.status === 'blocked_by_owner').length,
-      },
-      filters: built.catalog.filters.length,
-    }, null, 2));
+    if (!report) fail('REPORT_METADATA_MISSING', 'The report metadata request was not captured.');
+    const navigation = await inspectNavigation(page);
+    const pages = reportPages(report).map((reportPage) => ({
+      ...reportPage,
+      name: usablePageName(navigation.byId.get(reportPage.id)) || usablePageName(reportPage.name) || reportPage.id,
+    }));
+    const selectedPages = args['all-pages'] === true
+      ? pages
+      : args.page.map((selector) => resolveReportPageSelection(pages, selector));
+    const uniquePages = [...new Map(selectedPages.map((item) => [item.id, item])).values()];
+    const outDir = path.resolve(String(args.out || path.join(
+      os.homedir(),
+      'Downloads',
+      'looker-studio-data',
+      normalizedStart.reportId,
+      nowStamp(),
+    )));
+    ensurePrivateDir(outDir);
+    const pageResults = [];
+    const reportStartedAt = Date.now();
+    let seed = { report, reportRequest, schemas };
+    for (const reportPage of uniquePages) {
+      const pageStartedAt = Date.now();
+      const normalized = normalizeReportUrl(reportPageUrl(normalizedStart.url, reportPage.id));
+      const stem = path.join(outDir, reportPageFileStem(reportPage));
+      const paths = { catalogPath: `${stem}.catalog.json`, capturePath: `${stem}.catalog.capture.json` };
+      try {
+        const result = await collectPageCatalog(page, normalized, args, paths, seed);
+        if (!result) throw Object.assign(new Error('The page returned no catalog result.'), { code: 'CATALOG_EMPTY' });
+        seed = result.seed;
+        persistCatalogResult(result);
+        const summary = catalogCommandResult(result.built);
+        pageResults.push({
+          page: summary.current_page || { id: reportPage.id, name: reportPage.name },
+          status: summary.status,
+          capture: summary.capture,
+          datasets: summary.datasets,
+          filters: summary.filters,
+          filter_summary: result.built.catalog.filters.map((filter) => ({
+            label: filter.label,
+            current_value: filter.current_value,
+            scope: filter.scope,
+          })),
+          elapsed_ms: Date.now() - pageStartedAt,
+          catalog: summary.catalog,
+          private_capture: summary.private_capture,
+        });
+      } catch (error) {
+        pageResults.push({
+          page: { id: reportPage.id, name: reportPage.name },
+          status: 'failed',
+          elapsed_ms: Date.now() - pageStartedAt,
+          error: { code: error.code || 'UNEXPECTED_ERROR', message: String(error.message || error) },
+        });
+      }
+    }
+    const complete = pageResults.every((item) => item.status === 'ready');
+    const failed = pageResults.every((item) => ['empty', 'failed'].includes(item.status));
+    const manifestPath = path.join(outDir, 'manifest.json');
+    const manifest = {
+      schema_version: 1,
+      collector_version: VERSION,
+      generated_at: new Date().toISOString(),
+      elapsed_ms: Date.now() - reportStartedAt,
+      source_url: normalizedStart.url,
+      report: { id: normalizedStart.reportId, name: reportShareable(report).name || '' },
+      status: complete ? 'complete' : failed ? 'failed' : 'partial',
+      pages: pageResults,
+      security: { contains_cookies: false, contains_authorization_headers: false, file_mode: '0600' },
+    };
+    writePrivateJson(manifestPath, manifest);
+    const authStatePath = resolveAuthStatePath(args, profile);
+    if (fs.existsSync(authStatePath)) await persistBrowserAuthState(context, authStatePath);
+    console.log(JSON.stringify({ ok: complete, status: manifest.status, manifest: manifestPath, pages: pageResults }, null, 2));
+    if (!complete) process.exitCode = 1;
   } finally {
     await closeContext(context);
   }
@@ -1310,8 +1739,9 @@ async function waitForComponentTrace(state, componentId, timeoutMs) {
   return latest;
 }
 
-async function fetchComponentPage(page, endpoint, request, safeHeaders, referrer = '') {
-  const result = await page.evaluate(async ({ url, body, headers, requestReferrer }) => {
+async function fetchComponentPage(page, endpoint, request, safeHeaders, referrer = '', batchRequest = null, requestIndex = 0) {
+  const { body, targetIndex } = replaceBatchRequestTarget(batchRequest, request, requestIndex);
+  const result = await page.evaluate(async ({ url, requestBody, headers, requestReferrer }) => {
     const requestHeaders = { 'content-type': 'application/json;charset=UTF-8' };
     if (headers && headers['x-goog-authuser']) requestHeaders['x-goog-authuser'] = headers['x-goog-authuser'];
     if (headers && headers['x-goog-pageid']) requestHeaders['x-goog-pageid'] = headers['x-goog-pageid'];
@@ -1322,15 +1752,17 @@ async function fetchComponentPage(page, endpoint, request, safeHeaders, referrer
       credentials: 'include',
       headers: requestHeaders,
       referrer: requestReferrer || undefined,
-      body: JSON.stringify({ dataRequest: [body] }),
+      body: JSON.stringify(requestBody),
     });
     return { status: response.status, text: await response.text() };
-  }, { url: endpoint, body: request, headers: safeHeaders || {}, requestReferrer: referrer });
+  }, { url: endpoint, requestBody: body, headers: safeHeaders || {}, requestReferrer: referrer });
   if (result.status < 200 || result.status >= 300) {
     const detail = normalizeText(stripXssi(result.text)).slice(0, 800);
     throw new Error(`batchedDataV2 replay returned HTTP ${result.status}${detail ? `: ${detail}` : ''}.`);
   }
-  return parseJsonResponse(result.text, '/batchedDataV2');
+  const payload = parseJsonResponse(result.text, '/batchedDataV2');
+  if (targetIndex === 0) return payload;
+  return { ...payload, dataResponse: [payload.dataResponse && payload.dataResponse[targetIndex]] };
 }
 
 function nullIndexes(column) {
@@ -1468,16 +1900,37 @@ async function hoverVisibleNamedAction(page, labels) {
 }
 
 async function ensureNativeCsvSelected(dialog) {
-  const result = await dialog.evaluate((element) => {
-    const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
-    const labels = Array.from(element.querySelectorAll('label'));
-    const csv = labels.find((label) => normalize(label.textContent) === 'csv');
-    if (!csv) return { ok: false, reason: 'CSV option is not available.' };
-    const input = element.querySelector(`#${CSS.escape(csv.htmlFor)}`);
-    if (!input || input.type !== 'radio') return { ok: false, reason: 'CSV option is not a radio control.' };
-    if (!input.checked) csv.click();
-    return { ok: input.checked, reason: input.checked ? '' : 'CSV selection did not apply.' };
-  });
+  const formatTexts = await dialog.locator('label, [role="radio"], option, input[type="radio"]').evaluateAll((elements) => elements.map((element) =>
+    String(element.getAttribute('aria-label') || element.textContent || element.value || '').replace(/\s+/g, ' ').trim()).filter(Boolean));
+  const accepted = [...new Set(formatTexts.filter(isCsvFormatLabel))];
+  if (!accepted.length) {
+    throw new Error(`Looker Studio native export cannot select CSV: available formats are ${[...new Set(formatTexts)].join(' | ') || 'not visible'}.`);
+  }
+  const result = await dialog.evaluate((element, acceptedLabels) => {
+    const normalize = (value) => String(value || '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+    const accepted = new Set(acceptedLabels.map(normalize));
+    const candidates = Array.from(element.querySelectorAll('label, [role="radio"], option, input[type="radio"]'));
+    const text = (candidate) => normalize(candidate.getAttribute('aria-label') || candidate.textContent || candidate.value || '');
+    const matches = candidates.filter((candidate) => accepted.has(text(candidate)));
+    const target = matches.find((candidate) => candidate.tagName === 'LABEL')
+      || matches.find((candidate) => candidate.tagName === 'OPTION')
+      || matches[0];
+    if (!target) return { ok: false, reason: 'CSV option disappeared before selection.' };
+    if (target.tagName === 'OPTION') {
+      const select = target.parentElement;
+      if (!select || select.tagName !== 'SELECT') return { ok: false, reason: 'CSV option is not attached to a select control.' };
+      select.value = target.value;
+      select.dispatchEvent(new Event('input', { bubbles: true }));
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+      return { ok: select.value === target.value, reason: select.value === target.value ? '' : 'CSV selection did not apply.' };
+    }
+    target.click();
+    const input = target.tagName === 'LABEL' && target.htmlFor
+      ? element.querySelector(`#${CSS.escape(target.htmlFor)}`)
+      : target.matches('input') ? target : target.querySelector('input[type="radio"]');
+    const checked = input ? Boolean(input.checked || input.getAttribute('aria-checked') === 'true') : target.getAttribute('aria-checked') === 'true';
+    return { ok: checked, reason: checked ? '' : 'CSV selection did not apply.' };
+  }, accepted);
   if (!result.ok) throw new Error(`Looker Studio native export cannot select CSV: ${result.reason}`);
 }
 
@@ -1494,15 +1947,18 @@ async function downloadNativeCsv(page, component, output) {
   if (await menu.count() !== 1) {
     throw new Error(`Chart "${component.title}" does not expose one native chart menu.`);
   }
+  await chart.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
   await chart.hover({ timeout: 5000 });
   await menu.click({ timeout: 5000 });
-  await page.waitForTimeout(250);
-  await hoverVisibleNamedAction(page, ['导出图表…', 'Export chart']);
-  await page.waitForTimeout(250);
+  await page.waitForTimeout(500);
+  await hoverVisibleNamedAction(page, ['导出图表…', '导出图表', 'Export chart', 'Export chart…', 'Export chart...']);
+  await page.waitForTimeout(500);
   await clickVisibleNamedAction(page, ['导出数据', 'Export data']);
-  await page.waitForTimeout(250);
-  const dialog = page.locator('[role="dialog"]');
+  const dialog = page.locator('[role="dialog"]:visible');
+  await dialog.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
   if (await dialog.count() !== 1) throw new Error(`Chart "${component.title}" did not open a native export dialog.`);
+  await dialog.locator('label, [role="radio"], option, input[type="radio"]').first()
+    .waitFor({ state: 'attached', timeout: 5000 }).catch(() => {});
   await ensureNativeCsvSelected(dialog);
   const downloadPromise = page.waitForEvent('download', { timeout: 30000 });
   await clickVisibleNamedAction(page, ['导出', 'Export']);
@@ -1523,14 +1979,14 @@ async function downloadNativeCsv(page, component, output) {
 }
 
 function findCatalogComponent(catalog, selector) {
-  const exact = catalog.datasets.filter((item) => item.component_id === selector || item.title === selector);
-  if (exact.length === 1) return exact[0];
-  if (exact.length > 1) fail('AMBIGUOUS_COMPONENT', `Multiple datasets match "${selector}". Use the component ID.`);
-  const partial = catalog.datasets.filter((item) => item.title && item.title.includes(selector));
-  if (partial.length === 1) return partial[0];
-  fail('COMPONENT_NOT_FOUND', partial.length
-    ? `Multiple datasets partially match "${selector}". Use the component ID.`
-    : `No dataset matches "${selector}".`);
+  const result = selectCatalogComponent(catalog, selector);
+  if (result.ok) return result.component;
+  if (result.code === 'AMBIGUOUS_COMPONENT') {
+    fail('AMBIGUOUS_COMPONENT', `Multiple datasets match "${selector}". Choose one of the business labels.`, {
+      choices: result.choices,
+    });
+  }
+  fail('COMPONENT_NOT_FOUND', `No dataset matches "${selector}" on the current page.`);
 }
 
 function resolveExportPath(catalog, component, outArg) {
@@ -1605,8 +2061,11 @@ async function runExport(args) {
       safeHeaders: capturedComponent.safe_headers,
       referrer: capturedComponent.referrer,
       request: capturedComponent.request,
+      batchRequest: capturedComponent.batch_request,
+      requestIndex: capturedComponent.request_index,
       fields: capturedComponent.fields,
     };
+    const originalRequest = structuredClone(template.request);
     const request = structuredClone(template.request);
     const timezone = String(args.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC');
     const dateRule = resolveDateRule(args['date-rule'], timezone, args.date);
@@ -1622,23 +2081,49 @@ async function runExport(args) {
     let startRow = paginateInfo && Number(paginateInfo.startRow || 1) || 1;
     const rows = [];
     let headers = null;
-    let totalCount = null;
+    const catalogTotalCount = component.row_summary && component.row_summary.main
+      && Number(component.row_summary.main.totalCount);
+    let totalCount = Number.isFinite(catalogTotalCount) ? catalogTotalCount : null;
     let requestsMade = 0;
     let transportMode = 'direct_replay';
+    let replayCapability = 'not_needed';
+    let replayProbed = false;
     const output = resolveExportPath(catalog, component, args.out);
     let nativeDownload = null;
 
     try {
       while (true) {
-        if (paginateInfo) {
-          request.datasetSpec.paginateInfo = { ...request.datasetSpec.paginateInfo, startRow, rowsCount: pageSize };
-        }
         let payload;
         if (requestsMade === 0 && latest && latest.response && !appliedDate) {
           payload = { dataResponse: [latest.response] };
           transportMode = 'native_chart_response';
         } else {
-          payload = await fetchComponentPage(page, template.endpoint, request, template.safeHeaders, template.referrer);
+          if (!replayProbed) {
+            await fetchComponentPage(
+              page,
+              template.endpoint,
+              structuredClone(originalRequest),
+              template.safeHeaders,
+              template.referrer,
+              template.batchRequest,
+              template.requestIndex,
+            );
+            replayProbed = true;
+            replayCapability = template.batchRequest ? 'whole_batch_replay' : 'single_request_replay';
+          }
+          if (paginateInfo) {
+            request.datasetSpec.paginateInfo = { ...request.datasetSpec.paginateInfo, startRow, rowsCount: pageSize };
+          }
+          payload = await fetchComponentPage(
+            page,
+            template.endpoint,
+            request,
+            template.safeHeaders,
+            template.referrer,
+            template.batchRequest,
+            template.requestIndex,
+          );
+          transportMode = replayCapability;
         }
         requestsMade += 1;
         const table = mainTable(payload);
@@ -1657,6 +2142,7 @@ async function runExport(args) {
     } catch (error) {
       const canUseNativeFallback = isReplayRejected(error) && !appliedDate && args['recipe-out'] === undefined && totalCount !== null;
       if (!canUseNativeFallback) throw error;
+      replayCapability = 'unsupported';
       nativeDownload = await downloadNativeCsv(page, component, output);
       if (nativeDownload.rows !== totalCount) {
         fail('INCOMPLETE_NATIVE_DOWNLOAD', 'The native CSV row count does not match the chart total.', {
@@ -1702,6 +2188,8 @@ async function runExport(args) {
           referrer: template.referrer,
           fields: template.fields || capturedComponent.fields,
           request: structuredClone(request),
+          batch_request: template.batchRequest ? structuredClone(template.batchRequest) : null,
+          request_index: Number(template.requestIndex || 0),
         },
         security: {
           contains_cookies: false,
@@ -1730,6 +2218,7 @@ async function runExport(args) {
       },
       verification: {
         transport: transportMode,
+        replay_capability: replayCapability,
         complete,
         rows: exportedRows,
         total_count: totalCount,
@@ -1752,6 +2241,7 @@ async function runExport(args) {
       complete,
       sha256: checksum,
       transport: transportMode,
+      replay_capability: replayCapability,
       recipe: recipePath,
     }, null, 2));
   } finally {
@@ -1831,7 +2321,15 @@ async function runRecipe(args) {
       }
       let payload;
       try {
-        payload = await fetchComponentPage(page, dataTemplate.endpoint, request, dataTemplate.safe_headers, dataTemplate.referrer);
+        payload = await fetchComponentPage(
+          page,
+          dataTemplate.endpoint,
+          request,
+          dataTemplate.safe_headers,
+          dataTemplate.referrer,
+          dataTemplate.batch_request,
+          dataTemplate.request_index,
+        );
       } catch (error) {
         fail('RECIPE_STALE', 'The saved data request is no longer accepted. Refresh the page catalog and recreate this recipe.', {
           message: error.message,
@@ -2116,6 +2614,9 @@ Commands:
   catalog --url URL [--auth-state FILE] [--browser auto|chrome|edge|chromium]
           [--browser-path PATH]
           [--out catalog.json] [--headed] [--no-filter-values]
+  catalog-report --url URL (--page NAME_OR_ID_OR_URL ... | --all-pages)
+          [--out DIRECTORY] [--auth-state FILE] [--browser auto|chrome|edge|chromium]
+          [--browser-path PATH] [--headed] [--filter-values]
   export --catalog catalog.json --component ID_OR_TITLE [--date START:END]
          [--date-rule captured|fixed|today|yesterday|last-N-days|month-to-date|previous-month]
          [--timezone IANA_ZONE] [--recipe-out [recipe.json]]
@@ -2141,6 +2642,7 @@ async function main() {
   if (command === 'auth-export') return runAuthExport(args);
   if (command === 'status') return runStatus(args);
   if (command === 'catalog') return runCatalog(args);
+  if (command === 'catalog-report') return runCatalogReport(args);
   if (command === 'export') return runExport(args);
   if (command === 'run-recipe') return runRecipe(args);
   if (command === 'probe') return runProbe(args);
@@ -2150,5 +2652,5 @@ async function main() {
 }
 
 main().catch((error) => {
-  fail('UNEXPECTED_ERROR', String(error && error.message || error), undefined, 1);
+  fail(error && error.code || 'UNEXPECTED_ERROR', String(error && error.message || error), error && error.details, 1);
 });
