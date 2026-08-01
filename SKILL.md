@@ -1,20 +1,6 @@
 ---
 name: looker-studio-data
-description: Looker Studio 数据下载 skill。用户只需提供一个 Looker Studio/Data Studio 网页链接，agent 就会复用用户本人 Google 登录态，列出可选报表与筛选项，并按用户确认的条件导出一次性或重复使用的 CSV。适用于日报下载、批量取数和远程服务器定时抓取；不用于绕过访问权限、验证码、二次验证或报表所有者关闭的下载权限。
-license: Internal
-metadata:
-  scope: portable
-  version: 0.6.0
-  author: Codex
-  compatibility: [codex, claude-code, hermes, cursor, opencode]
-  tags: [looker-studio, data-studio, google-login, csv, report-export]
-  canonical_name: looker-studio-data
-  runtime_entry: looker-studio-data
-  aliases: [looker-studio, data-studio-data]
-  source_of_truth: repository-root
-  references:
-    - references/remote-runtime.md
-    - references/protocol.md
+description: Analyze and export data from Google Looker Studio or Data Studio report links using the user's own browser session and permissions. Use when an agent needs to inspect report pages and filters, catalog one or many pages, download verified CSV files, or prepare a same-machine repeatable export. Do not use to bypass access controls, MFA, CAPTCHA, owner-disabled downloads, or to extract hidden upstream data sources.
 ---
 
 # Looker Studio 数据下载
@@ -42,7 +28,7 @@ metadata:
 
 ## 结果导向原则
 
-- 自动适配 macOS、Windows 和 Linux。已有 Chrome 时优先使用这条已验证路径；没有 Chrome 再自动选择 Edge 或 Chromium。用户平时使用 Safari、Firefox 或其他浏览器也不影响。
+- 在 macOS 和 Windows 自动发现 Chrome、Edge 或 Chromium，并保持首次成功登录所用的浏览器类型。用户平时使用其他浏览器不构成前提。
 - 只保留一个外部运行依赖 Playwright；已有 AI 运行环境能够提供时直接复用。缺少运行条件时由 agent 处理，不把安装步骤推给业务用户。
 - 不写死登录、取数或保存路径。agent 根据本机、远程服务器、一次性或重复任务选择最短可验证方案。
 - skill 真源只保存代码和说明，禁止保存任何用户的登录状态、Cookie、浏览器 profile、账号信息、抓取目录、配方或 CSV。所有运行数据必须放在 skill 目录之外的用户私有目录；`security-audit` 和 `self-test` 发现混入时必须失败。
@@ -96,4 +82,4 @@ metadata:
 
 ## 真源
 
-此仓库根目录是唯一可编辑真源。分发到 Codex、Claude Code 或其他 agent 的副本应通过安装或软链接复用该目录，不维护第二份实现代码。
+此仓库根目录是唯一可编辑真源。分发副本应通过安装机制复用该目录，不维护第二份实现代码。

@@ -20,7 +20,7 @@
 
 登录只从 `https://datastudio.google.com/` 开始。用户本人在打开的浏览器窗口中输入账号、密码、MFA 和验证码；运行脚本只在登录完成后复用状态。
 
-私密文件：
+私密文件在 macOS 使用下列 mode；Windows 使用只允许当前用户和 SYSTEM 的 ACL，不能把 `chmod` 失败当作已保护：
 
 - profile：`0700`；
 - `auth-state.json`：`0600`，包含敏感 Cookie 和浏览器存储；
