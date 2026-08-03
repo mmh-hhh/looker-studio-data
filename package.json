@@ -12,7 +12,7 @@
   },
   "scripts": {
     "doctor": "node scripts/looker_studio_data.cjs doctor",
-    "test": "node --test tests/*.test.cjs",
+    "test": "node --test",
     "self-test": "node scripts/looker_studio_data.cjs self-test"
   }
 }
