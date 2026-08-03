@@ -1,5 +1,8 @@
 'use strict';
 
+const fs = require('node:fs');
+const path = require('node:path');
+
 function uniqueStrings(values) {
   return [...new Set((values || []).map((value) => String(value || '')).filter(Boolean))];
 }
@@ -9,14 +12,98 @@ function usablePageName(name) {
   return value && !/^(?:无标题页面|untitled page|page \d+)$/i.test(value) ? value : '';
 }
 
-function reportPageFileStem(page = {}) {
-  const safe = (value) => String(value || 'page')
+function portableSafeName(value, fallback = 'data', maxLength = 120) {
+  let normalized = String(value || fallback)
     .normalize('NFKC')
     .replace(/[\/\\:*?"<>|\u0000-\u001F]/g, '_')
     .replace(/\s+/g, '_')
     .replace(/_+/g, '_')
-    .replace(/^_+|_+$/g, '') || 'page';
-  return `${safe(usablePageName(page.name) || 'page')}_${safe(page.id || 'unknown')}`;
+    .replace(/^_+/, '')
+    .replace(/[. _]+$/g, '');
+  if (!normalized) normalized = fallback;
+  const reservedStem = normalized.split('.')[0];
+  if (/^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i.test(reservedStem)) normalized = `_${normalized}`;
+  normalized = normalized.slice(0, Math.max(1, Number(maxLength) || 120)).replace(/[. ]+$/g, '');
+  return normalized || fallback;
+}
+
+function reportPageFileStem(page = {}) {
+  return `${portableSafeName(usablePageName(page.name) || 'page', 'page', 72)}_${portableSafeName(page.id || 'unknown', 'unknown', 40)}`;
+}
+
+function replaceFilePortable(sourcePath, targetPath) {
+  if (!fs.existsSync(targetPath)) {
+    fs.renameSync(sourcePath, targetPath);
+    return;
+  }
+  const backupPath = `${targetPath}.${process.pid}.${Date.now()}.bak`;
+  fs.renameSync(targetPath, backupPath);
+  try {
+    fs.renameSync(sourcePath, targetPath);
+    fs.unlinkSync(backupPath);
+  } catch (error) {
+    try {
+      if (fs.existsSync(targetPath)) fs.unlinkSync(targetPath);
+      if (fs.existsSync(backupPath)) fs.renameSync(backupPath, targetPath);
+    } catch (restoreError) {
+      error.restoreError = restoreError;
+      error.backupPath = backupPath;
+    }
+    throw error;
+  }
+}
+
+function browserCandidatePaths(platform, env = process.env, home = '') {
+  if (platform === 'darwin') {
+    return [
+      { kind: 'chrome', path: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' },
+      { kind: 'edge', path: '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge' },
+      { kind: 'chromium', path: '/Applications/Chromium.app/Contents/MacOS/Chromium' },
+      { kind: 'chrome', path: path.posix.join(home, 'Applications/Google Chrome.app/Contents/MacOS/Google Chrome') },
+      { kind: 'edge', path: path.posix.join(home, 'Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge') },
+      { kind: 'chromium', path: path.posix.join(home, 'Applications/Chromium.app/Contents/MacOS/Chromium') },
+    ];
+  }
+  if (platform === 'win32') {
+    const win = path.win32;
+    const programFiles = env.PROGRAMFILES || 'C:\\Program Files';
+    const programFilesX86 = env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)';
+    const localAppData = env.LOCALAPPDATA || win.join(home, 'AppData', 'Local');
+    return [
+      { kind: 'chrome', path: win.join(programFiles, 'Google', 'Chrome', 'Application', 'chrome.exe') },
+      { kind: 'chrome', path: win.join(programFilesX86, 'Google', 'Chrome', 'Application', 'chrome.exe') },
+      { kind: 'chrome', path: win.join(localAppData, 'Google', 'Chrome', 'Application', 'chrome.exe') },
+      { kind: 'edge', path: win.join(programFiles, 'Microsoft', 'Edge', 'Application', 'msedge.exe') },
+      { kind: 'edge', path: win.join(programFilesX86, 'Microsoft', 'Edge', 'Application', 'msedge.exe') },
+      { kind: 'edge', path: win.join(localAppData, 'Microsoft', 'Edge', 'Application', 'msedge.exe') },
+    ];
+  }
+  return [
+    { kind: 'chrome', path: '/usr/bin/google-chrome' },
+    { kind: 'chrome', path: '/usr/bin/google-chrome-stable' },
+    { kind: 'edge', path: '/usr/bin/microsoft-edge' },
+    { kind: 'edge', path: '/usr/bin/microsoft-edge-stable' },
+    { kind: 'chromium', path: '/usr/bin/chromium' },
+    { kind: 'chromium', path: '/usr/bin/chromium-browser' },
+  ];
+}
+
+function browserTerminationPlan(platform, pid) {
+  if (platform === 'win32') {
+    return { command: 'taskkill', args: ['/PID', String(pid), '/T', '/F'] };
+  }
+  return { signal: 'SIGTERM', pid: Number(pid) };
+}
+
+function windowsPrivateAclArgs(target, userSid, directory = false) {
+  const permission = directory ? '(OI)(CI)(F)' : '(F)';
+  return [
+    String(target),
+    '/inheritance:r',
+    '/grant:r',
+    `*${userSid}:${permission}`,
+    `*S-1-5-18:${permission}`,
+  ];
 }
 
 function reportPageUrl(sourceUrl, pageId) {
@@ -153,10 +240,15 @@ function selectCatalogComponent(catalog, selector) {
 
 module.exports = {
   assessCaptureState,
+  browserCandidatePaths,
+  browserTerminationPlan,
   isCsvFormatLabel,
+  portableSafeName,
   replaceBatchRequestTarget,
+  replaceFilePortable,
   reportPageFileStem,
   reportPageUrl,
   selectCatalogComponent,
   usablePageName,
+  windowsPrivateAclArgs,
 };

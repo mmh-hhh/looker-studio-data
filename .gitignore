@@ -1,0 +1,22 @@
+node_modules/
+.DS_Store
+
+# Local workflow evidence
+plans/
+
+# Browser and authentication state
+auth-state*.json
+login-state*.json
+storage-state*.json
+*.auth.json
+google-profile/
+browser-profile/
+runtime-state/
+
+# Looker Studio runtime output
+*.capture.json
+*.catalog.json
+catalog.json
+manifest.json
+*.recipe.json
+*.csv

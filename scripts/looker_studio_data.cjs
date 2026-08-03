@@ -10,12 +10,17 @@ const readline = require('node:readline');
 
 const {
   assessCaptureState,
+  browserCandidatePaths,
+  browserTerminationPlan,
   isCsvFormatLabel,
+  portableSafeName,
   replaceBatchRequestTarget,
+  replaceFilePortable,
   reportPageFileStem,
   reportPageUrl,
   selectCatalogComponent,
   usablePageName,
+  windowsPrivateAclArgs,
 } = require('./looker_studio_core.cjs');
 
 function codexPlaywrightCandidates() {
@@ -23,16 +28,22 @@ function codexPlaywrightCandidates() {
   try {
     return fs.readdirSync(runtimeRoot, { withFileTypes: true })
       .filter((entry) => entry.isDirectory())
-      .map((entry) => path.join(runtimeRoot, entry.name, 'dependencies', 'node', 'node_modules', 'playwright'));
+      .flatMap((entry) => ['playwright', 'playwright-core'].map((packageName) =>
+        path.join(runtimeRoot, entry.name, 'dependencies', 'node', 'node_modules', packageName)));
   } catch {
     return [];
   }
 }
 
 function loadPlaywright() {
-  const attempts = [{ source: 'node-resolution', target: 'playwright' }];
+  if (process.env.LOOKER_DISABLE_PLAYWRIGHT_DISCOVERY === '1') return null;
+  const attempts = [
+    { source: 'node-resolution', target: 'playwright' },
+    { source: 'node-resolution', target: 'playwright-core' },
+  ];
   for (const moduleRoot of String(process.env.NODE_PATH || '').split(path.delimiter).filter(Boolean)) {
     attempts.push({ source: 'NODE_PATH', target: path.join(moduleRoot, 'playwright') });
+    attempts.push({ source: 'NODE_PATH', target: path.join(moduleRoot, 'playwright-core') });
   }
   for (const target of codexPlaywrightCandidates()) attempts.push({ source: 'codex-workspace', target });
   const seen = new Set();
@@ -48,18 +59,23 @@ function loadPlaywright() {
   return null;
 }
 
-const playwrightRuntime = loadPlaywright();
-if (!playwrightRuntime) {
-  console.error(JSON.stringify({
-    ok: false,
-    code: 'PLAYWRIGHT_NOT_FOUND',
-    message: 'Playwright is unavailable in local dependencies, NODE_PATH, or the Codex workspace runtime.',
-  }, null, 2));
-  process.exit(2);
+let playwrightRuntime;
+function getPlaywrightRuntime(required = false) {
+  if (playwrightRuntime === undefined) playwrightRuntime = loadPlaywright();
+  if (!playwrightRuntime && required) {
+    fail('PLAYWRIGHT_NOT_FOUND', 'Playwright is unavailable. Run npm ci in the skill directory, then retry.', {
+      checked: ['local dependencies', 'NODE_PATH', 'Codex workspace runtime'],
+    }, 2);
+  }
+  return playwrightRuntime;
 }
-const { chromium } = playwrightRuntime.module;
 
-const VERSION = '0.6.0';
+function getChromium(required = true) {
+  const runtime = getPlaywrightRuntime(required);
+  return runtime && runtime.module && runtime.module.chromium;
+}
+
+const VERSION = '0.7.0';
 const SKILL_ROOT = path.resolve(__dirname, '..');
 const DATA_ENDPOINT = /\/batchedDataV2\?/;
 const REPORT_ENDPOINT = /\/getReport\?/;
@@ -140,34 +156,7 @@ function findOnPath(names) {
 }
 
 function browserCandidates(platform = process.platform) {
-  if (platform === 'darwin') {
-    return [
-      { kind: 'chrome', path: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' },
-      { kind: 'edge', path: '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge' },
-      { kind: 'chromium', path: '/Applications/Chromium.app/Contents/MacOS/Chromium' },
-      { kind: 'chrome', path: path.join(os.homedir(), 'Applications', 'Google Chrome.app', 'Contents', 'MacOS', 'Google Chrome') },
-      { kind: 'edge', path: path.join(os.homedir(), 'Applications', 'Microsoft Edge.app', 'Contents', 'MacOS', 'Microsoft Edge') },
-      { kind: 'chromium', path: path.join(os.homedir(), 'Applications', 'Chromium.app', 'Contents', 'MacOS', 'Chromium') },
-    ];
-  }
-  if (platform === 'win32') {
-    return [
-      { kind: 'chrome', path: path.join(process.env.PROGRAMFILES || 'C:\\Program Files', 'Google', 'Chrome', 'Application', 'chrome.exe') },
-      { kind: 'chrome', path: path.join(process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)', 'Google', 'Chrome', 'Application', 'chrome.exe') },
-      { kind: 'chrome', path: path.join(process.env.LOCALAPPDATA || '', 'Google', 'Chrome', 'Application', 'chrome.exe') },
-      { kind: 'edge', path: path.join(process.env.PROGRAMFILES || 'C:\\Program Files', 'Microsoft', 'Edge', 'Application', 'msedge.exe') },
-      { kind: 'edge', path: path.join(process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)', 'Microsoft', 'Edge', 'Application', 'msedge.exe') },
-      { kind: 'edge', path: path.join(process.env.LOCALAPPDATA || '', 'Microsoft', 'Edge', 'Application', 'msedge.exe') },
-    ];
-  }
-  return [
-    { kind: 'chrome', path: '/usr/bin/google-chrome' },
-    { kind: 'chrome', path: '/usr/bin/google-chrome-stable' },
-    { kind: 'edge', path: '/usr/bin/microsoft-edge' },
-    { kind: 'edge', path: '/usr/bin/microsoft-edge-stable' },
-    { kind: 'chromium', path: '/usr/bin/chromium' },
-    { kind: 'chromium', path: '/usr/bin/chromium-browser' },
-  ];
+  return browserCandidatePaths(platform, process.env, os.homedir());
 }
 
 function detectBrowserExecutable(override, preferred = 'auto') {
@@ -197,21 +186,47 @@ function detectBrowserExecutable(override, preferred = 'auto') {
   if (pathMatch) return { kind: preferred === 'auto' ? 'system' : preferred, executablePath: pathMatch };
 
   if (preferred === 'auto' || preferred === 'chromium') {
-    const bundled = chromium.executablePath();
+    const chromium = getChromium(false);
+    const bundled = chromium && chromium.executablePath();
     if (isExecutable(bundled)) return { kind: 'playwright-chromium', executablePath: bundled };
   }
   return null;
 }
 
+let windowsUserSid;
+function currentWindowsUserSid() {
+  if (windowsUserSid) return windowsUserSid;
+  const result = childProcess.spawnSync('whoami', ['/user', '/fo', 'csv', '/nh'], { encoding: 'utf8', windowsHide: true });
+  const match = String(result.stdout || '').match(/S-1-5-[0-9-]+/i);
+  if (result.status !== 0 || !match) {
+    throw new Error(`Unable to determine the current Windows user SID: ${String(result.stderr || '').trim()}`);
+  }
+  windowsUserSid = match[0];
+  return windowsUserSid;
+}
+
+function applyPrivatePermissions(target, directory) {
+  if (process.platform !== 'win32') {
+    fs.chmodSync(target, directory ? 0o700 : 0o600);
+    return;
+  }
+  const userSid = currentWindowsUserSid();
+  const args = windowsPrivateAclArgs(target, userSid, directory);
+  const result = childProcess.spawnSync('icacls', args, { encoding: 'utf8', windowsHide: true });
+  if (result.status !== 0) {
+    throw new Error(`Unable to protect private ${directory ? 'directory' : 'file'} with Windows ACLs: ${String(result.stderr || result.stdout || '').trim()}`);
+  }
+}
+
 function ensurePrivateDir(directory) {
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  try { fs.chmodSync(directory, 0o700); } catch {}
+  applyPrivatePermissions(directory, true);
 }
 
 function writePrivateFile(filePath, contents) {
   ensurePrivateDir(path.dirname(filePath));
   fs.writeFileSync(filePath, contents, { encoding: 'utf8', mode: 0o600 });
-  try { fs.chmodSync(filePath, 0o600); } catch {}
+  applyPrivatePermissions(filePath, false);
 }
 
 function writePrivateJson(filePath, value) {
@@ -223,13 +238,7 @@ function nowStamp() {
 }
 
 function safeName(value) {
-  const normalized = String(value || 'data')
-    .normalize('NFKC')
-    .replace(/[\/\\:*?"<>|\u0000-\u001F]/g, '_')
-    .replace(/\s+/g, '_')
-    .replace(/_+/g, '_')
-    .replace(/^_+|_+$/g, '');
-  return (normalized || 'data').slice(0, 120);
+  return portableSafeName(value, 'data', 120);
 }
 
 function stripXssi(text) {
@@ -261,6 +270,7 @@ function normalizeReportUrl(rawUrl) {
 }
 
 async function launchProfileContext(profileDir, headed, args = {}) {
+  const chromium = getChromium(true);
   ensurePrivateDir(profileDir);
   const choice = String(args.browser || 'auto').toLowerCase();
   const browser = detectBrowserExecutable(args['browser-path'] || args.chrome, choice);
@@ -384,16 +394,17 @@ async function persistBrowserAuthState(context, authStatePath) {
   const temporaryPath = `${authStatePath}.${process.pid}.${Date.now()}.tmp`;
   try {
     await context.storageState({ path: temporaryPath, indexedDB: true });
-    try { fs.chmodSync(temporaryPath, 0o600); } catch {}
+    applyPrivatePermissions(temporaryPath, false);
     validateAuthStateFile(temporaryPath);
-    fs.renameSync(temporaryPath, authStatePath);
-    try { fs.chmodSync(authStatePath, 0o600); } catch {}
+    replaceFilePortable(temporaryPath, authStatePath);
+    applyPrivatePermissions(authStatePath, false);
   } finally {
     if (fs.existsSync(temporaryPath)) fs.unlinkSync(temporaryPath);
   }
 }
 
 async function launchPortableBrowser(args, headed) {
+  const chromium = getChromium(true);
   const choice = String(args.browser || 'auto').toLowerCase();
   const browser = detectBrowserExecutable(args['browser-path'] || args.chrome, choice);
   if (!browser) {
@@ -476,7 +487,15 @@ function processExists(pid) {
 async function stopLoginBrowser(pid) {
   if (!pid || !processExists(pid)) return;
   try {
-    process.kill(pid, 'SIGTERM');
+    const plan = browserTerminationPlan(process.platform, pid);
+    if (plan.command) {
+      const result = childProcess.spawnSync(plan.command, plan.args, { encoding: 'utf8', windowsHide: true });
+      if (result.status !== 0 && processExists(pid)) {
+        throw new Error(String(result.stderr || result.stdout || `exit ${result.status}`).trim());
+      }
+    } else {
+      process.kill(plan.pid, plan.signal);
+    }
   } catch (error) {
     fail('BROWSER_CLOSE_FAILED', 'The dedicated browser process could not be closed for login verification.', {
       pid,
@@ -1151,31 +1170,43 @@ function resolveCatalogPaths(normalized, outArg) {
 }
 
 async function runDoctor(args) {
+  const runtime = getPlaywrightRuntime(false);
   const profile = path.resolve(String(args.profile || defaultProfileDir()));
   const authStatePath = resolveAuthStatePath(args, profile);
   const loginStatePath = path.resolve(String(args._loginStateManifest || defaultLoginStatePath(profile)));
   const choice = String(args.browser || 'auto').toLowerCase();
   const detectedBrowser = detectBrowserExecutable(args['browser-path'] || args.chrome, choice);
   ensurePrivateDir(profile);
-  console.log(JSON.stringify({
-    ok: true,
+  const result = {
+    ok: Boolean(runtime),
     version: VERSION,
     node: process.version,
     platform: process.platform,
-    playwright: true,
-    playwright_source: playwrightRuntime.source,
+    playwright: Boolean(runtime),
+    playwright_source: runtime ? runtime.source : null,
+    dependency_issue: runtime ? null : {
+      code: 'PLAYWRIGHT_NOT_FOUND',
+      message: 'Run npm ci in the skill directory, then run doctor again.',
+    },
     browser_choice: choice,
     detected_browser: detectedBrowser,
-    interactive_login_supported: Boolean(detectedBrowser),
+    interactive_login_supported: Boolean(runtime && detectedBrowser),
     profile,
-    profile_mode: (fs.statSync(profile).mode & 0o777).toString(8),
+    profile_protection: process.platform === 'win32' ? 'windows_acl_current_user_and_system' : 'posix_mode_0700',
+    profile_mode: process.platform === 'win32' ? null : (fs.statSync(profile).mode & 0o777).toString(8),
     auth_state: authStatePath,
     auth_state_exists: fs.existsSync(authStatePath),
-    auth_state_mode: fs.existsSync(authStatePath) ? (fs.statSync(authStatePath).mode & 0o777).toString(8) : null,
+    auth_state_protection: fs.existsSync(authStatePath)
+      ? process.platform === 'win32' ? 'windows_acl_current_user_and_system' : 'posix_mode_0600'
+      : null,
+    auth_state_mode: fs.existsSync(authStatePath) && process.platform !== 'win32'
+      ? (fs.statSync(authStatePath).mode & 0o777).toString(8) : null,
     login_state: loginStatePath,
     login_state_exists: fs.existsSync(loginStatePath),
     portable_browser: args.browser || 'auto',
-  }, null, 2));
+  };
+  console.log(JSON.stringify(result, null, 2));
+  if (!result.ok) process.exitCode = 2;
 }
 
 async function runLogin(args) {

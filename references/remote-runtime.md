@@ -4,13 +4,13 @@
 
 ## 最小运行条件
 
-- 支持 macOS、Windows 和 Linux；
-- Node.js 是基础运行时；
+- 验收目标是 macOS Chrome、Windows Chrome 和 Windows Edge；
+- Node.js 18 或更高版本是基础运行时；
 - Playwright 是唯一外部运行依赖；
 - 浏览器自动按 Chrome、Edge、Chromium 的顺序选择；
 - AI 环境已经提供 Playwright 时直接复用，不重复安装。
 
-脚本按以下顺序自动发现 Playwright：仓库本地依赖、当前 `NODE_PATH`、Codex workspace bundled runtime。三处都不存在时以 `PLAYWRIGHT_NOT_FOUND` 失败关闭，不尝试静默降级为 DOM 抓取或截图。`doctor` 的 `playwright_source` 可用于确认实际来源。
+脚本按以下顺序自动发现 `playwright` 或 `playwright-core`：仓库本地依赖、当前 `NODE_PATH`、Codex workspace bundled runtime。缺少依赖时，`doctor` 返回结构化 `PLAYWRIGHT_NOT_FOUND` 和恢复建议；`self-test`、`security-audit` 仍可运行。真正需要打开浏览器的命令会失败关闭，不静默降级为 DOM 抓取或截图。`doctor` 的 `playwright_source` 可用于确认实际来源。
 
 用户平时使用 Safari、Firefox 或其他浏览器没有关系。skill 使用独立的自动化浏览器状态，不读取用户日常浏览器中的密码。
 
@@ -20,7 +20,7 @@
 
 - skill 目录只放代码和文档；
 - profile、登录态、目录、配方和 CSV 放在私有运行目录；
-- macOS/Linux 使用 `0700`、`0600`；Windows 使用当前用户专属目录和等效 ACL；
+- macOS 使用 `0700`、`0600`；Windows 移除继承权限并只授予当前用户和 SYSTEM 完全控制，ACL 设置失败时停止写入；
 - 所有运行数据排除在 Git、公共制品和普通日志之外。
 
 ## 登录方案按结果选择
